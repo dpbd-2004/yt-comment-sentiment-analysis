@@ -107,8 +107,15 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: eu-north-1
         run: |
-          nohup python flask_app/app.py &
+          # Start the app in the background
+          nohup python flask_app/app.py > flask.log 2>&1 &
+
+          # Wait for the server to be ready (Health Check)
+          echo "Waiting for Flask to start..."
+          timeout 60s bash -c 'until curl -s localhost:5000/; do sleep 2; done'
+          echo "Flask is up!"
 
       - name: Run Flask API tests
         run: |
-          pytest scripts/test_flask_api.py
+          # If tests fail, print the flask log so you can see why it crashed
+          pytest scripts/test_flask_api.py || (cat flask.log && exit 1)
