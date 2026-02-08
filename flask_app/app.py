@@ -18,7 +18,7 @@ import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
-# Use non-interactive backend
+# Use non-interactive backend for server environments
 matplotlib.use('Agg')
 
 app = Flask(__name__)
@@ -50,15 +50,14 @@ def preprocess_comment(comment):
         return comment
 
 def load_model_and_vectorizer(model_name, model_version, vectorizer_filename):
-    """Load model from MLflow and vectorizer from one level above the script."""
+    """Load model from MLflow and vectorizer from the root folder."""
     mlflow.set_tracking_uri("http://ec2-13-48-27-69.eu-north-1.compute.amazonaws.com:5000")
     
     model_uri = f"models:/{model_name}/{model_version}"
     
-    # --- LOGIC TO FIND FILE IN ROOT ---
-    # Goes from /flask_app/app.py -> /tfidf_vectorizer.pkl
-    base_path = os.path.dirname(os.path.abspath(__file__)) # This is the flask_app folder
-    root_path = os.path.dirname(base_path)                 # This is the project root
+    # Locate vectorizer file
+    base_path = os.path.dirname(os.path.abspath(__file__)) 
+    root_path = os.path.dirname(base_path)                 
     vectorizer_path = os.path.join(root_path, vectorizer_filename)
     
     print(f"[*] Looking for vectorizer at: {vectorizer_path}")
@@ -66,7 +65,7 @@ def load_model_and_vectorizer(model_name, model_version, vectorizer_filename):
     model = mlflow.pyfunc.load_model(model_uri)
     
     if not os.path.exists(vectorizer_path):
-        raise FileNotFoundError(f"❌ Could not find {vectorizer_filename} in the root folder!")
+        raise FileNotFoundError(f"❌ Could not find {vectorizer_filename} at {vectorizer_path}")
         
     vectorizer = joblib.load(vectorizer_path)
     print(f"✅ Successfully loaded model and vectorizer.")
@@ -85,8 +84,42 @@ except Exception as e:
 
 # --- Routes ---
 
+@app.route('/predict', methods=['POST'])
+def predict():
+    """Predict sentiment for a simple list of comments."""
+    if not model or not vectorizer:
+        return jsonify({"error": "Model/Vectorizer not loaded"}), 500
+
+    data = request.json
+    comments = data.get('comments', [])
+    
+    if not comments:
+        return jsonify({"error": "No comments provided"}), 400
+
+    try:
+        # 1. Preprocess
+        preprocessed_comments = [preprocess_comment(comment) for comment in comments]
+        
+        # 2. Transform to Sparse Matrix
+        transformed = vectorizer.transform(preprocessed_comments)
+        
+        # 3. SCHEMA FIX: Convert to DataFrame with feature names
+        feature_names = vectorizer.get_feature_names_out()
+        df_input = pd.DataFrame(transformed.toarray(), columns=feature_names)
+        
+        # 4. Predict
+        predictions = model.predict(df_input).tolist()
+        predictions = [str(pred) for pred in predictions]
+
+        response = [{"comment": c, "sentiment": s} for c, s in zip(comments, predictions)]
+        return jsonify(response)
+        
+    except Exception as e:
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
+
 @app.route('/predict_with_timestamps', methods=['POST'])
 def predict_with_timestamps():
+    """Predict sentiment and retain timestamps for trend analysis."""
     if not model or not vectorizer:
         return jsonify({"error": "Model/Vectorizer not loaded"}), 500
 
@@ -100,18 +133,13 @@ def predict_with_timestamps():
         comments = [item.get('text', '') for item in comments_data]
         timestamps = [item.get('timestamp', '') for item in comments_data]
 
-        # 1. Preprocess
         preprocessed = [preprocess_comment(c) for c in comments]
-        
-        # 2. Vectorize
         transformed = vectorizer.transform(preprocessed)
         
-        # 3. FIX: Convert to DataFrame with feature names to satisfy MLflow schema
-        # get_feature_names_out() gives the list of words (columns) in order
+        # SCHEMA FIX: Convert to DataFrame
         feature_names = vectorizer.get_feature_names_out()
         df_input = pd.DataFrame(transformed.toarray(), columns=feature_names)
         
-        # 4. Predict using the DataFrame
         predictions = model.predict(df_input).tolist()
         
         response = [
@@ -121,11 +149,8 @@ def predict_with_timestamps():
         return jsonify(response)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc() 
         return jsonify({"error": f"Schema Mismatch or Prediction Error: {str(e)}"}), 500
 
-# (Keep your other routes like /generate_chart the same)
 @app.route('/generate_chart', methods=['POST'])
 def generate_chart():
     try:
@@ -134,8 +159,10 @@ def generate_chart():
         labels = ['Positive', 'Neutral', 'Negative']
         sizes = [int(counts.get('1', 0)), int(counts.get('0', 0)), int(counts.get('-1', 0))]
         if sum(sizes) == 0: return jsonify({"error": "No data"}), 400
+        
         plt.figure(figsize=(6, 6))
         plt.pie(sizes, labels=labels, colors=['#36A2EB', '#C9CBCF', '#FF6384'], autopct='%1.1f%%', startangle=140)
+        
         img_io = io.BytesIO()
         plt.savefig(img_io, format='PNG', transparent=True)
         img_io.seek(0)
@@ -151,6 +178,7 @@ def generate_wordcloud():
         comments = data.get('comments', [])
         text = ' '.join([preprocess_comment(c) for c in comments])
         wc = WordCloud(width=800, height=400, background_color='black', colormap='Blues').generate(text)
+        
         img_io = io.BytesIO()
         wc.to_image().save(img_io, format='PNG')
         img_io.seek(0)
@@ -165,17 +193,23 @@ def generate_trend_graph():
         df = pd.DataFrame(data.get('sentiment_data', []))
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
-        # Handle case where resample 'M' might fail on small datasets
+        
+        # 'ME' handles end of month resampling in newer pandas versions
         monthly = df.resample('ME')['sentiment'].value_counts().unstack(fill_value=0)
         for val in [-1, 0, 1]:
             if val not in monthly.columns: monthly[val] = 0
+            
         monthly = monthly[[-1, 0, 1]]
         pct = (monthly.T / monthly.sum(axis=1)).T * 100
+        
         plt.figure(figsize=(10, 5))
         for val, color, lbl in [(-1, 'red', 'Negative'), (0, 'gray', 'Neutral'), (1, 'green', 'Positive')]:
             plt.plot(pct.index, pct[val], marker='o', label=lbl, color=color)
+        
         plt.title('Monthly Sentiment Trend')
         plt.legend()
+        plt.tight_layout()
+        
         img_io = io.BytesIO()
         plt.savefig(img_io, format='PNG')
         img_io.seek(0)
