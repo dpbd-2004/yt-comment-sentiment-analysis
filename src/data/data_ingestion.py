@@ -55,7 +55,7 @@ def load_data(data_url: str) -> pd.DataFrame:
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     """Preprocess the data by handling missing values, duplicates, and empty strings."""
     try:
-        # Removing missing values
+        # Removing missing values !
         df.dropna(inplace=True)
         # Removing duplicates
         df.drop_duplicates(inplace=True)
